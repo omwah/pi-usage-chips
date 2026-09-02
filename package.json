@@ -1,0 +1,31 @@
+{
+  "name": "pi-usage-chips",
+  "version": "0.1.0",
+  "description": "Pi extension that surfaces Opencode Go and OpenAI Codex quota usage as statusline chips",
+  "type": "module",
+  "scripts": {
+    "test": "tsx usage-chips.test.mts"
+  },
+  "pi": {
+    "extensions": [
+      "./usage-chips.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "usage",
+    "quota",
+    "opencode-go",
+    "openai-codex",
+    "statusline",
+    "usage-monitoring"
+  ],
+  "files": [
+    "usage-chips.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT"
+}
