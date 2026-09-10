@@ -1,7 +1,7 @@
 {
   "name": "pi-usage-chips",
   "version": "0.1.0",
-  "description": "Pi extension that surfaces Opencode Go and OpenAI Codex quota usage as statusline chips",
+  "description": "Pi extension that surfaces Opencode Go, OpenAI Codex, and Antigravity quota usage as statusline chips",
   "type": "module",
   "scripts": {
     "test": "tsx usage-chips.test.mts"
@@ -19,6 +19,7 @@
     "quota",
     "opencode-go",
     "openai-codex",
+    "antigravity",
     "statusline",
     "usage-monitoring"
   ],

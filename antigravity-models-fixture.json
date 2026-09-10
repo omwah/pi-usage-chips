@@ -1,0 +1,16 @@
+{
+  "models": {
+    "gemini-3.8-flash-low": {
+      "quotaInfo": {
+        "remainingFraction": 0.7757472,
+        "resetTime": "2026-09-17T02:12:20Z"
+      }
+    },
+    "claude-sonnet-4-6": {
+      "quotaInfo": {
+        "remainingFraction": 1,
+        "resetTime": "2026-09-17T02:17:58Z"
+      }
+    }
+  }
+}

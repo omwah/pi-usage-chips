@@ -6,15 +6,16 @@ status row. Self-contained — no runtime dependencies.
 
 ## Supported providers
 
-| Provider     | Trigger models                               | Source                                                      | Chip id  |
-| ------------ | -------------------------------------------- | ----------------------------------------------------------- | -------- |
-| Opencode Go  | `opencode-go/*`                              | Dashboard scrape of `opencode.ai/workspace/<id>/go`          | `go`     |
-| OpenAI Codex | `openai-codex/*`, or `openai/*` codex models | `chatgpt.com/backend-api/wham/usage` via pi's provider auth  | `codex`  |
+| Provider     | Trigger models                               | Source                                                                    | Chip id       |
+| ------------ | -------------------------------------------- | ------------------------------------------------------------------------- | ------------- |
+| Opencode Go  | `opencode-go/*`                              | Dashboard scrape of `opencode.ai/workspace/<id>/go`                        | `go`          |
+| OpenAI Codex | `openai-codex/*`, or `openai/*` codex models | `chatgpt.com/backend-api/wham/usage` via pi's provider auth                | `codex`       |
+| Antigravity  | `antigravity/*`                              | User quota summary / available models endpoints via pi's provider auth/token | `antigravity` |
 
-Exactly one chip is visible at a time — the chip for whichever of the two
-providers the active model belongs to. Switching models swaps the chips;
-switching to any other provider clears both. Other providers (Z.ai,
-DeepSeek, plain `openai`, ollama, …) are intentionally not shown.
+Exactly one chip is visible at a time — the chip for whichever provider the
+active model belongs to. Switching models swaps the chips; switching to any
+other unmonitored provider clears them. Other providers (Z.ai, DeepSeek,
+plain `openai`, ollama, …) are intentionally not shown.
 
 ## What it looks like
 
@@ -26,6 +27,7 @@ DeepSeek, plain `openai`, ollama, …) are intentionally not shown.
   icons, no separators.
 - Go windows are rolling / weekly / monthly. Codex windows are 5-hour /
   weekly (+ an `S`-prefixed spark window when the model has one).
+  Antigravity windows are Gemini weekly / Claude & GPT weekly.
 - The percentage is **burn-colored** (Tokyo Night Storm palette, matching
   the statusline's own colors): green < 60% ≤ yellow < 85% ≤ red. The
   `(reset-in)` time stays uncolored.
@@ -33,8 +35,8 @@ DeepSeek, plain `openai`, ollama, …) are intentionally not shown.
   `/statusline events log`.
 
 Errors become a sticky red chip on the same slot — `Go usage failed`,
-`Codex auth error`, or `Codex error` — with the underlying message in the
-`detail` field.
+`Codex auth error`, `Codex error`, `Antigravity auth error`, or `Antigravity error` — with the
+underlying message in the `detail` field.
 
 ## Install
 
@@ -83,6 +85,15 @@ No configuration — the extension asks pi's model registry for Codex
 credentials (the same auth used by `openai-codex` models, refreshed
 automatically). Log in with `/login` for OpenAI ChatGPT Plus/Pro (Codex).
 Without it, the chip shows `Codex auth error`.
+
+### Antigravity
+
+No configuration — the extension queries pi's model registry (or reads
+stored OAuth credentials from `~/.pi/agent/auth.json`) for Antigravity
+access tokens. Log in with `/login antigravity`. Without it, the chip shows
+`Antigravity auth error`. Quota is retrieved from `retrieveUserQuotaSummary`
+with automatic fallback to `fetchAvailableModels` if the user is on a tier
+lacking the aggregate summary RPC.
 
 ## How it works
 

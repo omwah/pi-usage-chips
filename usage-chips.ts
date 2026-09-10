@@ -14,6 +14,12 @@
  *     endpoint, authenticated via pi's own provider auth
  *     (`ctx.modelRegistry.getApiKeyAndHeaders`).
  *
+ *   - `antigravity/*` → Antigravity quota pools (Gemini weekly,
+ *     Claude/GPT 3P weekly) from the Antigravity user quota summary /
+ *     available models endpoints, authenticated via pi's provider auth
+ *     (`ctx.modelRegistry.getApiKeyForProvider` or `getApiKeyAndHeaders`,
+ *     or stored ~/.pi/agent/auth.json).
+ *
  * Rendering contract with @wierdbytes/pi-statusline: each provider gets
  * ONE `notify:status` chip on pi's shared event bus. The statusline
  * emits a chip as `<icon> <levelColor><label><reset>` where the icon is
@@ -32,6 +38,7 @@ const COOLDOWN_MS = 30_000;
 const BUS_CHANNEL = "notify:status";
 const CHIP_GO = "go";
 const CHIP_CODEX = "codex";
+const CHIP_ANTIGRAVITY = "antigravity";
 
 // Tokyo Night Storm truecolor codes, matching the statusline's own
 // C_GREEN / C_YELLOW / C_RED in @wierdbytes/pi-statusline blocks.ts.
@@ -416,6 +423,235 @@ export async function fetchCodexUsage(ctx: CodexContext): Promise<CodexUsage> {
   }
 }
 
+// ───────────────────────── Antigravity scraper ─────────────────────────
+
+export const ANTIGRAVITY_BASE_URL =
+  process.env.PI_USAGE_CHIPS_ANTIGRAVITY_BASE_URL ??
+  process.env.ANTIGRAVITY_BASE_URL ??
+  "https://cloudcode-pa.googleapis.com";
+const ANTIGRAVITY_SCRAPE_TIMEOUT_MS = 10_000;
+const ANTIGRAVITY_USER_AGENT =
+  "antigravity/cli/1.1.23 (aidev_client; os_type=linux; arch=amd64; cl=974125021; auth_method=consumer)";
+
+export interface AntigravityUsage {
+  gemini: UsageWindow | null;
+  thirdParty: UsageWindow | null;
+}
+
+export class AntigravityAuthError extends Error {}
+
+export function isAntigravityModel(model: unknown): boolean {
+  const m = model as { provider?: string; id?: string } | null | undefined;
+  if (!m?.provider) return false;
+  return m.provider.toLowerCase().startsWith("antigravity");
+}
+
+function parseResetTime(resetTime?: string): number {
+  if (!resetTime) return 0;
+  const ts = Date.parse(resetTime);
+  if (!Number.isFinite(ts)) return 0;
+  return Math.max(0, (ts - Date.now()) / 1000);
+}
+
+function clampFraction(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+export function extractAntigravityUsage(quotaSummaryData: unknown): AntigravityUsage {
+  const usage: AntigravityUsage = { gemini: null, thirdParty: null };
+  if (!isRecord(quotaSummaryData) || !Array.isArray(quotaSummaryData.groups)) return usage;
+
+  for (const group of quotaSummaryData.groups) {
+    if (!isRecord(group) || !Array.isArray(group.buckets)) continue;
+    const groupName = String(group.displayName ?? "").toLowerCase();
+    const isGemini = groupName.includes("gemini");
+    const is3P = groupName.includes("claude") || groupName.includes("gpt") || groupName.includes("3p");
+
+    for (const bucket of group.buckets) {
+      if (!isRecord(bucket)) continue;
+      const bucketId = String(bucket.bucketId ?? "").toLowerCase();
+      const remaining = clampFraction(bucket.remainingFraction);
+      if (remaining === undefined) continue;
+      const usagePercent = (1 - remaining) * 100;
+      const resetInSec = parseResetTime(bucket.resetTime ? String(bucket.resetTime) : undefined);
+
+      if (isGemini || bucketId.includes("gemini")) {
+        if (!usage.gemini) usage.gemini = { usagePercent, resetInSec };
+      } else if (is3P || bucketId.includes("3p")) {
+        if (!usage.thirdParty) usage.thirdParty = { usagePercent, resetInSec };
+      }
+    }
+  }
+
+  return usage;
+}
+
+export function extractAntigravityFromModels(modelsData: unknown): AntigravityUsage {
+  const usage: AntigravityUsage = { gemini: null, thirdParty: null };
+  if (!isRecord(modelsData) || !isRecord(modelsData.models)) return usage;
+
+  for (const [modelId, info] of Object.entries(modelsData.models)) {
+    if (!isRecord(info)) continue;
+    const qi = isRecord(info.quotaInfo) ? info.quotaInfo : undefined;
+    if (!qi) continue;
+    const remaining = clampFraction(qi.remainingFraction);
+    if (remaining === undefined) continue;
+    const usagePercent = (1 - remaining) * 100;
+    const resetInSec = parseResetTime(qi.resetTime ? String(qi.resetTime) : undefined);
+
+    const lowerId = modelId.toLowerCase();
+    if (lowerId.startsWith("gemini")) {
+      if (!usage.gemini) usage.gemini = { usagePercent, resetInSec };
+    } else if (lowerId.startsWith("claude") || lowerId.startsWith("gpt")) {
+      if (!usage.thirdParty) usage.thirdParty = { usagePercent, resetInSec };
+    }
+  }
+
+  return usage;
+}
+
+interface AntigravityCredentials {
+  token: string;
+  projectId?: string;
+}
+
+export function loadStoredAntigravityAuth(): AntigravityCredentials | null {
+  try {
+    const authPath =
+      process.env.PI_USAGE_CHIPS_AUTH_FILE ?? join(homedir(), ".pi", "agent", "auth.json");
+    const raw = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>;
+    const ag = raw.antigravity;
+    if (!isRecord(ag)) return null;
+    const token = typeof ag.access === "string" ? ag.access.trim() : "";
+    if (!token) return null;
+    const projectId = typeof ag.projectId === "string" ? ag.projectId.trim() : undefined;
+    return { token, projectId };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveAntigravityCredentials(ctx: CodexContext): Promise<AntigravityCredentials> {
+  const registry = (ctx as { modelRegistry?: unknown }).modelRegistry as
+    | {
+        getApiKeyForProvider?: (provider: string) => Promise<string | undefined>;
+        getApiKeyAndHeaders?: (model: unknown) => Promise<{
+          ok: boolean;
+          apiKey?: string;
+          headers?: Record<string, string>;
+          error?: string;
+        }>;
+      }
+    | undefined;
+
+  if (registry?.getApiKeyForProvider) {
+    try {
+      const apiKey = await registry.getApiKeyForProvider("antigravity");
+      if (apiKey) {
+        try {
+          const parsed = JSON.parse(apiKey) as Partial<{ token?: string; projectId?: string }>;
+          if (parsed.token) {
+            return { token: parsed.token, projectId: parsed.projectId };
+          }
+        } catch {
+          return { token: apiKey };
+        }
+      }
+    } catch {
+      // fallback
+    }
+  }
+
+  if (registry?.getApiKeyAndHeaders) {
+    try {
+      const auth = await registry.getApiKeyAndHeaders({ provider: "antigravity" });
+      if (auth.ok && auth.apiKey) {
+        try {
+          const parsed = JSON.parse(auth.apiKey) as Partial<{ token?: string; projectId?: string }>;
+          if (parsed.token) {
+            return { token: parsed.token, projectId: parsed.projectId };
+          }
+        } catch {
+          return { token: auth.apiKey };
+        }
+      }
+    } catch {
+      // fallback
+    }
+  }
+
+  const stored = loadStoredAntigravityAuth();
+  if (stored) return stored;
+
+  throw new AntigravityAuthError(
+    "No Antigravity credentials found. Log in with /login antigravity.",
+  );
+}
+
+export async function fetchAntigravityUsage(ctx: CodexContext): Promise<AntigravityUsage> {
+  const creds = await resolveAntigravityCredentials(ctx);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ANTIGRAVITY_SCRAPE_TIMEOUT_MS);
+
+  const headers = {
+    Authorization: `Bearer ${creds.token}`,
+    "Content-Type": "application/json",
+    "User-Agent": ANTIGRAVITY_USER_AGENT,
+  };
+
+  try {
+    // 1. Try retrieveUserQuotaSummary
+    try {
+      const res = await fetch(`${ANTIGRAVITY_BASE_URL}/v1internal:retrieveUserQuotaSummary`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+        signal: controller.signal,
+      });
+      if (res.ok) {
+        const text = await res.text();
+        const data = JSON.parse(text) as unknown;
+        const usage = extractAntigravityUsage(data);
+        if (usage.gemini || usage.thirdParty) {
+          return usage;
+        }
+      }
+    } catch {
+      // Fall through to fetchAvailableModels
+    }
+
+    // 2. Fallback to fetchAvailableModels
+    const res = await fetch(`${ANTIGRAVITY_BASE_URL}/v1internal:fetchAvailableModels`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ project: creds.projectId ?? "" }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Antigravity endpoint returned ${res.status} ${res.statusText}`);
+    }
+    const text = await res.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch (err) {
+      throw new Error(
+        `Antigravity response was not valid JSON: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+    const usage = extractAntigravityFromModels(data);
+    if (!usage.gemini && !usage.thirdParty) {
+      throw new Error("Antigravity endpoint did not include any usable quota window");
+    }
+    return usage;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ───────────────────────── extension ─────────────────────────
 
 interface CodexContext {
@@ -424,7 +660,7 @@ interface CodexContext {
   [key: string]: unknown;
 }
 
-type ProviderId = "go" | "codex";
+type ProviderId = "go" | "codex" | "antigravity";
 
 function providerOf(model: unknown): ProviderId | null {
   const m = model as { provider?: string; id?: string } | null | undefined;
@@ -432,6 +668,7 @@ function providerOf(model: unknown): ProviderId | null {
   const provider = m.provider.toLowerCase();
   if (provider.startsWith("opencode-go")) return "go";
   if (isCodexModel(m)) return "codex";
+  if (isAntigravityModel(m)) return "antigravity";
   return null;
 }
 
@@ -442,6 +679,7 @@ export default function extension(pi: {
   const caches: Record<ProviderId, { lastFetch: number; data: unknown | null }> = {
     go: { lastFetch: 0, data: null },
     codex: { lastFetch: 0, data: null },
+    antigravity: { lastFetch: 0, data: null },
   };
 
   function emit(payload: Record<string, unknown>): void {
@@ -459,6 +697,7 @@ export default function extension(pi: {
   function clearAll(): void {
     clearChip(CHIP_GO);
     clearChip(CHIP_CODEX);
+    clearChip(CHIP_ANTIGRAVITY);
   }
 
   /** Emit one usage chip whose visible row rides in `icon` (verbatim,
@@ -505,23 +744,41 @@ export default function extension(pi: {
           (w): w is UsageWindow => w !== null,
         );
         emitUsageChip(CHIP_GO, windows);
-      } else {
+      } else if (provider === "codex") {
         const now = Date.now();
         if (!cache.data || now - cache.lastFetch >= COOLDOWN_MS) {
           cache.lastFetch = now;
           cache.data = await fetchCodexUsage(ctx as CodexContext);
         }
         emitUsageChip(CHIP_CODEX, codexWindows(cache.data as CodexUsage));
+      } else {
+        const now = Date.now();
+        if (!cache.data || now - cache.lastFetch >= COOLDOWN_MS) {
+          cache.lastFetch = now;
+          cache.data = await fetchAntigravityUsage(ctx as CodexContext);
+        }
+        const usage = cache.data as AntigravityUsage;
+        const windows = [usage.gemini, usage.thirdParty].filter(
+          (w): w is UsageWindow => w !== null,
+        );
+        emitUsageChip(CHIP_ANTIGRAVITY, windows);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (provider === "go") {
         emitError(CHIP_GO, "Go usage failed", message);
-      } else {
+      } else if (provider === "codex") {
         const authMissing = err instanceof CodexAuthError;
         emitError(
           CHIP_CODEX,
           authMissing ? "Codex auth error" : "Codex error",
+          message,
+        );
+      } else {
+        const authMissing = err instanceof AntigravityAuthError;
+        emitError(
+          CHIP_ANTIGRAVITY,
+          authMissing ? "Antigravity auth error" : "Antigravity error",
           message,
         );
       }
@@ -532,7 +789,9 @@ export default function extension(pi: {
     const provider = providerOf(model);
     if (!provider) return;
     await refresh(provider, ctx);
-    clearChip(provider === "go" ? CHIP_CODEX : CHIP_GO);
+    if (provider !== "go") clearChip(CHIP_GO);
+    if (provider !== "codex") clearChip(CHIP_CODEX);
+    if (provider !== "antigravity") clearChip(CHIP_ANTIGRAVITY);
   }
 
   pi.on("session_start", async (_event, ctx) => {

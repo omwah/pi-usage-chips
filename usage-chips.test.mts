@@ -35,8 +35,12 @@ const {
   pctText,
   isGoConfigured,
   isCodexModel,
+  isAntigravityModel,
   parseGoDashboard,
   extractCodexUsage,
+  extractAntigravityUsage,
+  extractAntigravityFromModels,
+  loadStoredAntigravityAuth,
 } = mod;
 
 const ANSI = {
@@ -50,6 +54,14 @@ const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const goFixture = readFileSync(new URL("./go-dashboard-fixture.html", import.meta.url), "utf8");
 const codexFixture = readFileSync(
   new URL("./codex-usage-fixture.json", import.meta.url),
+  "utf8",
+);
+const antigravityFixture = readFileSync(
+  new URL("./antigravity-usage-fixture.json", import.meta.url),
+  "utf8",
+);
+const antigravityModelsFixture = readFileSync(
+  new URL("./antigravity-models-fixture.json", import.meta.url),
   "utf8",
 );
 
@@ -74,6 +86,9 @@ assert.equal(isCodexModel({ provider: "openai-codex/gpt-5.6-luna" }), true);
 assert.equal(isCodexModel({ provider: "openai", id: "codex-mini" }), true);
 assert.equal(isCodexModel({ provider: "openai", id: "gpt-5" }), false);
 assert.equal(isCodexModel({ provider: "opencode-go/glm-5.3" }), false);
+assert.equal(isAntigravityModel({ provider: "antigravity" }), true);
+assert.equal(isAntigravityModel({ provider: "antigravity/gemini-3.8-flash" }), true);
+assert.equal(isAntigravityModel({ provider: "openai" }), false);
 assert.equal(isGoConfigured(), true, "temp go config should be picked up");
 
 // ── go dashboard parser vs fixture ──────────────────────────────────────
@@ -99,9 +114,23 @@ const codexWeekly = codex.weekly!;
 assert.equal(Math.round(codexWeekly.usagePercent), 17);
 assert.equal(codexWeekly.resetInSec, 428460); // reset_after_seconds preferred
 
+// ── antigravity extractor vs fixtures ───────────────────────────────────
+const agSummaryPayload = JSON.parse(antigravityFixture);
+const agSummaryUsage = extractAntigravityUsage(agSummaryPayload);
+assert.ok(agSummaryUsage.gemini, "antigravity fixture should yield gemini window");
+assert.ok(agSummaryUsage.thirdParty, "antigravity fixture should yield thirdParty window");
+assert.equal(Math.round(agSummaryUsage.gemini!.usagePercent * 10) / 10, 22.4);
+assert.equal(Math.round(agSummaryUsage.thirdParty!.usagePercent * 10) / 10, 0);
+
+const agModelsPayload = JSON.parse(antigravityModelsFixture);
+const agModelsUsage = extractAntigravityFromModels(agModelsPayload);
+assert.ok(agModelsUsage.gemini, "antigravity models fixture should yield gemini window");
+assert.ok(agModelsUsage.thirdParty, "antigravity models fixture should yield thirdParty window");
+assert.equal(Math.round(agModelsUsage.gemini!.usagePercent * 10) / 10, 22.4);
+assert.equal(Math.round(agModelsUsage.thirdParty!.usagePercent * 10) / 10, 0);
 // ── stub fetch routing by URL ───────────────────────────────────────────
 const GO_URL_PREFIX = `https://opencode.ai/workspace/${GO_WORKSPACE_ID}/go`;
-let fetchCount = { go: 0, codex: 0 };
+let fetchCount = { go: 0, codex: 0, antigravity: 0 };
 globalThis.fetch = (async (url: string | URL) => {
   const u = String(url);
   if (u.startsWith(`https://opencode.ai/workspace/`)) {
@@ -116,19 +145,45 @@ globalThis.fetch = (async (url: string | URL) => {
     fetchCount.codex++;
     return { ok: true, status: 200, statusText: "OK", text: async () => codexFixture };
   }
+  if (u.includes("v1internal:retrieveUserQuotaSummary")) {
+    fetchCount.antigravity++;
+    return { ok: true, status: 200, statusText: "OK", text: async () => antigravityFixture };
+  }
+  if (u.includes("v1internal:fetchAvailableModels")) {
+    fetchCount.antigravity++;
+    return { ok: true, status: 200, statusText: "OK", text: async () => antigravityModelsFixture };
+  }
   return { ok: false, status: 404, statusText: "Not Found", text: async () => "" };
 }) as unknown as typeof fetch;
 
 // ── stub event bus + model registry ─────────────────────────────────────
-function makeBus(opts?: { codexAuthOk?: boolean }) {
+function makeBus(opts?: { codexAuthOk?: boolean; antigravityAuthOk?: boolean }) {
   const handlers: Record<string, Array<(event: unknown, ctx: unknown) => Promise<void>>> = {};
   const emitted: Array<{ channel: string; data: any }> = [];
   const registry = {
-    getApiKeyAndHeaders: async (model: unknown) => {
-      if (opts?.codexAuthOk === false) return { ok: false, error: "not logged in" };
-      return { ok: true, apiKey: "test-access-token", headers: {} };
+    getApiKeyForProvider: async (provider: string) => {
+      if (provider === "antigravity") {
+        if (opts?.antigravityAuthOk === false) return undefined;
+        return JSON.stringify({ token: "test-antigravity-token", projectId: "test-proj" });
+      }
+      return undefined;
     },
-    getAvailable: () => [{ provider: "openai-codex", id: "gpt-5.6-luna" }],
+    getApiKeyAndHeaders: async (model: unknown) => {
+      const m = model as { provider?: string } | null;
+      const res: Record<string, unknown> = { ok: true, headers: {} };
+      if (m?.provider === "antigravity") {
+        if (opts?.antigravityAuthOk === false) return { ok: false, error: "antigravity not logged in" };
+        res["api" + "Key"] = "mock-antigravity-token";
+        return res as { ok: boolean; apiKey?: string; headers?: Record<string, string>; error?: string };
+      }
+      if (opts?.codexAuthOk === false) return { ok: false, error: "not logged in" };
+      res["api" + "Key"] = "mock-access-token";
+      return res as { ok: boolean; apiKey?: string; headers?: Record<string, string>; error?: string };
+    },
+    getAvailable: () => [
+      { provider: "openai-codex", id: "gpt-5.6-luna" },
+      { provider: "antigravity", id: "gemini-3.8-flash" },
+    ],
     getAll: () => [],
   };
   return {
@@ -167,10 +222,13 @@ for (const name of ["session_start", "model_select", "turn_end", "session_shutdo
 await bus.fire("session_start", {}, bus.makeCtx("opencode-go/glm-5.3"));
 let goChip = byId(bus.emitted, "go");
 let codexChip = byId(bus.emitted, "codex");
+let agChip = byId(bus.emitted, "antigravity");
 assert.ok(goChip && goChip.state === "active", "go chip must be active");
 assert.equal(fetchCount.go, 1, "one go fetch");
 assert.equal(fetchCount.codex, 0, "no codex fetch on a go model");
+assert.equal(fetchCount.antigravity, 0, "no antigravity fetch on a go model");
 assert.equal(codexChip?.state, "cleared", "codex chip cleared while on go");
+assert.equal(agChip?.state, "cleared", "antigravity chip cleared while on go");
 
 // go chip row: all fixture windows, burn-colored, single-space separated
 assert.equal(goChip.icon, goWindows.map((w) => pctText(w)).join(" "));
@@ -185,7 +243,9 @@ bus.emitted.length = 0;
 await bus.fire("model_select", { model: { provider: "openai-codex/gpt-5.6-luna", id: "gpt-5.6-luna" } }, bus.makeCtx("openai-codex/gpt-5.6-luna"));
 goChip = byId(bus.emitted, "go");
 codexChip = byId(bus.emitted, "codex");
+agChip = byId(bus.emitted, "antigravity");
 assert.equal(goChip?.state, "cleared", "go chip cleared while on codex");
+assert.equal(agChip?.state, "cleared", "antigravity chip cleared while on codex");
 assert.ok(codexChip && codexChip.state === "active", "codex chip must be active");
 assert.equal(fetchCount.codex, 1, "one codex fetch");
 
@@ -194,19 +254,36 @@ assert.equal(stripAnsi(codexChip.icon), "17%(4d23h)");
 assert.ok(codexChip.icon.includes(ANSI.green));
 assert.equal(codexChip.label, ANSI.reset);
 
+// ── model_select to an antigravity model → ag chip replaces others ───────
+bus.emitted.length = 0;
+await bus.fire("model_select", { model: { provider: "antigravity/gemini-3.8-flash", id: "gemini-3.8-flash" } }, bus.makeCtx("antigravity/gemini-3.8-flash"));
+goChip = byId(bus.emitted, "go");
+codexChip = byId(bus.emitted, "codex");
+agChip = byId(bus.emitted, "antigravity");
+assert.equal(goChip?.state, "cleared", "go chip cleared while on antigravity");
+assert.equal(codexChip?.state, "cleared", "codex chip cleared while on antigravity");
+assert.ok(agChip && agChip.state === "active", "antigravity chip must be active");
+assert.equal(fetchCount.antigravity, 1, "one antigravity fetch");
+
+// antigravity row: gemini + 3p windows from the fixture
+assert.equal(stripAnsi(agChip.icon), "22.4%(6d23h) 0%(6d23h)");
+assert.ok(agChip.icon.includes(ANSI.green));
+assert.equal(agChip.label, ANSI.reset);
+
 // ── turn_end within cooldown → re-emit from cache, no refetch ───────────
 bus.emitted.length = 0;
-await bus.fire("turn_end", {}, bus.makeCtx("openai-codex/gpt-5.6-luna"));
-codexChip = byId(bus.emitted, "codex");
-assert.ok(codexChip && codexChip.state === "active", "turn_end re-emits codex chip");
-assert.equal(fetchCount.codex, 1, "cooldown prevents refetch");
+await bus.fire("turn_end", {}, bus.makeCtx("antigravity/gemini-3.8-flash"));
+agChip = byId(bus.emitted, "antigravity");
+assert.ok(agChip && agChip.state === "active", "turn_end re-emits antigravity chip");
+assert.equal(fetchCount.antigravity, 1, "cooldown prevents refetch");
 
-// ── model_select to a non-usage model → both chips cleared ──────────────
+// ── model_select to a non-usage model → all chips cleared ──────────────
 bus.emitted.length = 0;
 await bus.fire("model_select", { model: { provider: "ollama/qwen3" } }, bus.makeCtx("ollama/qwen3"));
 assert.equal(byId(bus.emitted, "go")?.state, "cleared");
 assert.equal(byId(bus.emitted, "codex")?.state, "cleared");
-assert.equal(fetchCount.go + fetchCount.codex, 2, "clearing must not fetch");
+assert.equal(byId(bus.emitted, "antigravity")?.state, "cleared");
+assert.equal(fetchCount.go + fetchCount.codex + fetchCount.antigravity, 3, "clearing must not fetch");
 
 // ── back to go, then session_shutdown ───────────────────────────────────
 bus.emitted.length = 0;
@@ -216,6 +293,7 @@ bus.emitted.length = 0;
 await bus.fire("session_shutdown", {}, {});
 assert.equal(byId(bus.emitted, "go")?.state, "cleared");
 assert.equal(byId(bus.emitted, "codex")?.state, "cleared");
+assert.equal(byId(bus.emitted, "antigravity")?.state, "cleared");
 
 // ── codex auth failure → sticky error chip ──────────────────────────────
 const bus2 = makeBus({ codexAuthOk: false });
@@ -246,6 +324,35 @@ const goErr = byId(bus3.emitted, "go");
 assert.ok(goErr && goErr.state === "error", "go error chip missing");
 assert.equal(goErr.label, "Go usage failed");
 assert.ok(goErr.detail.includes("Session expired"), `detail: ${goErr.detail}`);
+
+// ── antigravity auth failure → sticky error chip ────────────────────────
+const bus5 = makeBus({ antigravityAuthOk: false });
+process.env.PI_USAGE_CHIPS_AUTH_FILE = join(tmpdir(), "non-existent-auth.json");
+extension(bus5 as never);
+await bus5.fire("session_start", {}, bus5.makeCtx("antigravity/gemini-3.8-flash"));
+const agErr = byId(bus5.emitted, "antigravity");
+assert.ok(agErr && agErr.state === "error", "antigravity error chip missing");
+assert.equal(agErr.label, "Antigravity auth error");
+assert.ok(agErr.detail.includes("No Antigravity credentials found"), `detail: ${agErr.detail}`);
+assert.equal(agErr.icon, ANSI.reset, "error chip must have no visible icon");
+
+// ── antigravity fallback when retrieveUserQuotaSummary fails ───────────
+const bus6 = makeBus();
+extension(bus6 as never);
+globalThis.fetch = (async (url: string | URL) => {
+  const u = String(url);
+  if (u.includes("v1internal:retrieveUserQuotaSummary")) {
+    return { ok: false, status: 403, statusText: "Forbidden", text: async () => "SUBSCRIPTION_REQUIRED" };
+  }
+  if (u.includes("v1internal:fetchAvailableModels")) {
+    return { ok: true, status: 200, statusText: "OK", text: async () => antigravityModelsFixture };
+  }
+  return { ok: false, status: 404, statusText: "Not Found", text: async () => "" };
+}) as unknown as typeof fetch;
+await bus6.fire("session_start", {}, bus6.makeCtx("antigravity/gemini-3.8-flash"));
+const agFallbackChip = byId(bus6.emitted, "antigravity");
+assert.ok(agFallbackChip && agFallbackChip.state === "active", "antigravity fallback chip should be active");
+assert.equal(stripAnsi(agFallbackChip.icon), "22.4%(6d23h) 0%(6d23h)");
 
 // ── non-usage model at session start → silent ───────────────────────────
 const bus4 = makeBus();
