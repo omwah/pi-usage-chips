@@ -6,8 +6,8 @@
  * Supported providers, shown only while the active model matches:
  *
  *   - `opencode-go/*`  → Opencode Go rolling/weekly/monthly quota,
- *     scraped from the dashboard page configured in
- *     `~/.pi/agent/opencode-go.json` (workspaceId + auth cookie).
+ *     from the console status API configured in
+ *     `~/.pi/agent/opencode-go.json` (workspaceId + session cookie).
  *
  *   - `openai-codex/*` (or `openai/*` codex models) → OpenAI Codex
  *     5-hour/weekly (+spark) windows from the ChatGPT Codex usage
@@ -130,31 +130,60 @@ export function isGoConfigured(): boolean {
   return loadGoConfig() !== null;
 }
 
-/** Match the SolidJS SSR hydration output; field order may vary, so each
- *  window regex has a pct-first and a reset-first variant. */
-function parseGoWindow(html: string, name: string): UsageWindow | null {
-  const num = "(-?\\d+(?:\\.\\d+)?)";
-  const res = [
-    new RegExp(`${name}:\\$R\\[\\d+\\]=\\{[^}]*usagePercent:${num}[^}]*resetInSec:${num}[^}]*\\}`),
-    new RegExp(`${name}:\\$R\\[\\d+\\]=\\{[^}]*resetInSec:${num}[^}]*usagePercent:${num}[^}]*\\}`),
-  ];
-  for (const re of res) {
-    const m = re.exec(html);
-    if (!m) continue;
-    const usagePercent = Number(re === res[0] ? m[1] : m[2]);
-    const resetInSec = Number(re === res[0] ? m[2] : m[1]);
-    if (Number.isFinite(usagePercent) && Number.isFinite(resetInSec)) {
-      return { usagePercent, resetInSec };
-    }
+// The console page is now a client-side SPA, so usage comes from its JSON
+// API: GET /console/api/go/status, authenticated with the browser's
+// host-only session cookie and scoped to a workspace via the x-org-id header.
+const GO_STATUS_URL = "https://opencode.ai/console/api/go/status";
+const GO_COOKIE_NAME = "__Host-console_session";
+
+/** Accept either a bare cookie value (wrapped in the browser's host-only
+ *  name) or a full Cookie header pasted from dev tools. */
+function goCookieHeader(authCookie: string): string {
+  const trimmed = authCookie.trim().replace(/;$/, "");
+  return trimmed.includes("=") ? trimmed : `${GO_COOKIE_NAME}=${trimmed}`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+/** Money fields arrive as JSON strings (the server models them as bigint). */
+function goMicroCents(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
   }
   return null;
 }
 
-export function parseGoDashboard(html: string): GoUsage {
+/** Parse a /console/api/go/status payload: access.meters[fiveHour|week|month]
+ *  with usedMicroCents / limitMicroCents and resetsAt timestamps. Percent is
+ *  the used share of the window limit; the monthly meter falls back to the
+ *  subscription period end (access.endsAt) when it has no resetsAt of its own. */
+export function parseGoDashboard(payload: unknown): GoUsage {
+  const access = asRecord(asRecord(payload)?.access);
+  const meters = asRecord(access?.meters);
+  const none: GoUsage = { rolling: null, weekly: null, monthly: null };
+  if (!meters) return none;
+  const periodEndMs = typeof access?.endsAt === "string" ? Date.parse(access.endsAt) : NaN;
+  const readWindow = (raw: unknown): UsageWindow | null => {
+    const w = asRecord(raw);
+    if (!w) return null;
+    const used = goMicroCents(w.usedMicroCents);
+    const limit = goMicroCents(w.limitMicroCents);
+    if (used === null || limit === null || limit <= 0) return null;
+    const ownResetMs = typeof w.resetsAt === "string" ? Date.parse(w.resetsAt) : NaN;
+    const resetMs = Number.isFinite(ownResetMs) ? ownResetMs : periodEndMs;
+    return {
+      usagePercent: Math.min(100, Math.max(0, (used / limit) * 100)),
+      resetInSec: Number.isFinite(resetMs) ? Math.round((resetMs - Date.now()) / 1000) : 0,
+    };
+  };
   return {
-    rolling: parseGoWindow(html, "rollingUsage"),
-    weekly: parseGoWindow(html, "weeklyUsage"),
-    monthly: parseGoWindow(html, "monthlyUsage"),
+    rolling: readWindow(meters.fiveHour),
+    weekly: readWindow(meters.week),
+    monthly: readWindow(meters.month),
   };
 }
 
@@ -166,26 +195,45 @@ export async function fetchGoUsage(): Promise<GoUsage> {
   if (!/^wrk_[A-Za-z0-9]+$/.test(config.workspaceId)) {
     throw new Error(`Invalid workspaceId format: "${config.workspaceId}"`);
   }
-  if (!config.authCookie.startsWith("Fe26.2**")) {
-    throw new Error("Invalid authCookie format — expected an Iron-sealed session cookie");
+  if (!config.authCookie.trim()) {
+    throw new Error("Missing authCookie — paste your console session cookie");
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GO_SCRAPE_TIMEOUT_MS);
   try {
-    const response = await fetch(
-      `https://opencode.ai/workspace/${config.workspaceId}/go`,
-      {
-        headers: { Cookie: `auth=${config.authCookie}`, "User-Agent": GO_USER_AGENT },
-        signal: controller.signal,
+    const response = await fetch(GO_STATUS_URL, {
+      headers: {
+        // The console scopes every request to a workspace with this header.
+        Cookie: goCookieHeader(config.authCookie),
+        "x-org-id": config.workspaceId,
+        Accept: "application/json",
+        "User-Agent": GO_USER_AGENT,
       },
-    );
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("Session expired or auth invalid — refresh your cookie");
+    }
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location") ?? "";
+      if (/auth|login|sign-?in/i.test(location)) {
+        throw new Error("Session expired or auth invalid — refresh your cookie");
+      }
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
-    if (!response.url.includes(`/workspace/${config.workspaceId}/go`)) {
-      throw new Error("Session expired or auth invalid — refresh your cookie");
+    const payload = (await response.json().catch(() => undefined)) as unknown;
+    // A null body is the console's "no Go subscription here" answer.
+    if (payload === null) {
+      throw new Error("No Go subscription on this workspace");
     }
-    return parseGoDashboard(await response.text());
+    if (payload === undefined) {
+      throw new Error("Go status endpoint returned no JSON payload");
+    }
+    return parseGoDashboard(payload);
   } finally {
     clearTimeout(timer);
   }

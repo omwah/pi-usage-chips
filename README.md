@@ -66,15 +66,20 @@ it the events are simply published to the bus and ignored.
 ```json
 {
   "workspaceId": "wrk_...",
-  "authCookie": "Fe26.2**..."
+  "authCookie": "<value>"
 }
 ```
 
-Copy the `auth` cookie from a logged-in browser session on the workspace
-dashboard. These cookies expire server-side after a while; when that
+Quota data comes from the console's status API
+(`/console/api/go/status`), scoped to the workspace via the `x-org-id`
+header, so the cookie is the browser's host-only session cookie:
+copy the `__Host-console_session` cookie value from a logged-in browser
+session on `opencode.ai` (a full `Cookie:` header pasted from dev tools
+also works). These cookies expire server-side after a while; when that
 happens the Go chip turns into a red `Go usage failed` and the detail
 says `Session expired or auth invalid — refresh your cookie`. Re-copy the
-cookie to fix.
+cookie to fix. The dashboard page itself is a client-side SPA now, so the
+old HTML-scraping config no longer applies.
 
 For tests, the config path can be overridden with the
 `PI_USAGE_CHIPS_GO_CONFIG` environment variable.

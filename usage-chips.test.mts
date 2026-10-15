@@ -2,8 +2,8 @@
  * Test harness for usage-chips.ts — run with:
  *   npm test          (or: npx tsx usage-chips.test.mts)
  *
- * Stubs global fetch (routing wham → codex fixture JSON, opencode.ai →
- * go dashboard fixture HTML) and stubs pi's modelRegistry, then drives
+ * Stubs global fetch (routing wham → codex fixture JSON, console go status
+ * → go fixture JSON) and stubs pi's modelRegistry, then drives
  * the extension's lifecycle handlers and asserts chip emission for both
  * providers against the @wierdbytes/pi-statusline rendering rules.
  *
@@ -51,7 +51,9 @@ const ANSI = {
 };
 const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
-const goFixture = readFileSync(new URL("./go-dashboard-fixture.html", import.meta.url), "utf8");
+const goStatusFixture = JSON.parse(
+  readFileSync(new URL("./go-status-fixture.json", import.meta.url), "utf8"),
+);
 const codexFixture = readFileSync(
   new URL("./codex-usage-fixture.json", import.meta.url),
   "utf8",
@@ -91,19 +93,25 @@ assert.equal(isAntigravityModel({ provider: "antigravity/gemini-3.8-flash" }), t
 assert.equal(isAntigravityModel({ provider: "openai" }), false);
 assert.equal(isGoConfigured(), true, "temp go config should be picked up");
 
-// ── go dashboard parser vs fixture ──────────────────────────────────────
-const go = parseGoDashboard(goFixture);
+// ── go status parser vs fixture ────────────────────────────────────────
+const go = parseGoDashboard(goStatusFixture);
 const goWindows = [go.rolling, go.weekly, go.monthly].filter((w) => w !== null);
 assert.ok(goWindows.length >= 1, "go fixture must parse to at least one window");
-// order-independent cross-check against the raw fixture text
-for (const [name, win] of [["rollingUsage", go.rolling], ["weeklyUsage", go.weekly], ["monthlyUsage", go.monthly]] as const) {
-  if (!win) continue;
-  const block = new RegExp(`${name}:\\$R\\[\\d+\\]=\\{[^}]*\\}`).exec(goFixture)![0];
-  const fixturePct = Number(/usagePercent:(-?[\d.]+)/.exec(block)![1]);
-  const fixtureReset = Number(/resetInSec:(-?[\d.]+)/.exec(block)![1]);
-  assert.equal(win.usagePercent, fixturePct);
-  assert.equal(win.resetInSec, fixtureReset);
+// cross-check percentages against the fixture's micro-cent meter values
+const goMeters = [goStatusFixture.access.meters.fiveHour, goStatusFixture.access.meters.week, goStatusFixture.access.meters.month];
+const goParsed = [go.rolling, go.weekly, go.monthly];
+for (let i = 0; i < 3; i++) {
+  const raw: { usedMicroCents: string; limitMicroCents: string; resetsAt?: string } | undefined = goMeters[i];
+  const win = goParsed[i];
+  if (!raw || !win) continue;
+  const pct = (Number(raw.usedMicroCents) / Number(raw.limitMicroCents)) * 100;
+  assert.ok(Math.abs(win.usagePercent - pct) < 0.01, `window ${i} percent must match used/limit`);
+  // reset follows the meter's resetsAt, falling back to the period end
+  const resetSource = raw.resetsAt ?? goStatusFixture.access.endsAt;
+  const expectedSec = (Date.parse(resetSource) - Date.now()) / 1000;
+  assert.ok(Math.abs(win.resetInSec - expectedSec) <= 2, `window ${i} reset must follow resetsAt/endsAt`);
 }
+assert.ok(go.monthly, "monthly window should fall back to access.endsAt");
 
 // ── codex extractor vs fixture ──────────────────────────────────────────
 const codexPayload = JSON.parse(codexFixture);
@@ -129,16 +137,17 @@ assert.ok(agModelsUsage.thirdParty, "antigravity models fixture should yield thi
 assert.equal(Math.round(agModelsUsage.gemini!.usagePercent * 10) / 10, 22.4);
 assert.equal(Math.round(agModelsUsage.thirdParty!.usagePercent * 10) / 10, 0);
 // ── stub fetch routing by URL ───────────────────────────────────────────
-const GO_URL_PREFIX = `https://opencode.ai/workspace/${GO_WORKSPACE_ID}/go`;
+const GO_STATUS_URL = "https://opencode.ai/console/api/go/status";
 let fetchCount = { go: 0, codex: 0, antigravity: 0 };
 globalThis.fetch = (async (url: string | URL) => {
   const u = String(url);
-  if (u.startsWith(`https://opencode.ai/workspace/`)) {
+  if (u === GO_STATUS_URL) {
     fetchCount.go++;
     return {
       ok: true,
-      url: u.startsWith(GO_URL_PREFIX) ? u : "https://auth.opencode.ai/authorize",
-      text: async () => goFixture,
+      status: 200,
+      statusText: "OK",
+      json: async () => goStatusFixture,
     };
   }
   if (u === "https://chatgpt.com/backend-api/wham/usage") {
@@ -265,8 +274,12 @@ assert.equal(codexChip?.state, "cleared", "codex chip cleared while on antigravi
 assert.ok(agChip && agChip.state === "active", "antigravity chip must be active");
 assert.equal(fetchCount.antigravity, 1, "one antigravity fetch");
 
-// antigravity row: gemini + 3p windows from the fixture
-assert.equal(stripAnsi(agChip.icon), "22.4%(6d23h) 0%(6d23h)");
+// antigravity row: gemini + 3p windows from the fixture (expected values
+// derived from the extractor so the assertion is time-independent)
+const agExpectedRow = [agSummaryUsage.gemini, agSummaryUsage.thirdParty]
+  .map((w) => stripAnsi(pctText(w!)))
+  .join(" ");
+assert.equal(stripAnsi(agChip.icon), agExpectedRow);
 assert.ok(agChip.icon.includes(ANSI.green));
 assert.equal(agChip.label, ANSI.reset);
 
@@ -309,13 +322,13 @@ assert.equal(errChip.icon, ANSI.reset, "error chip must have no visible icon");
 // ── go cookie failure → sticky error chip ───────────────────────────────
 const bus3 = makeBus();
 extension(bus3 as never);
-// corrupt the temp config so the redirect guard trips (auth.opencode.ai URL)
+// force a 401 from the console status API
 writeFileSync(goConfigFile, JSON.stringify({ workspaceId: GO_WORKSPACE_ID, authCookie: "Fe26.2**expired" }));
 globalThis.fetch = (async (url: string | URL) => {
   const u = String(url);
-  if (u.startsWith("https://opencode.ai/workspace/")) {
+  if (u === "https://opencode.ai/console/api/go/status") {
     fetchCount.go++;
-    return { ok: true, url: "https://auth.opencode.ai/authorize", text: async () => "<html/>" };
+    return { ok: false, status: 401, statusText: "Unauthorized" };
   }
   throw new Error("unexpected fetch " + u);
 }) as unknown as typeof fetch;
@@ -352,7 +365,7 @@ globalThis.fetch = (async (url: string | URL) => {
 await bus6.fire("session_start", {}, bus6.makeCtx("antigravity/gemini-3.8-flash"));
 const agFallbackChip = byId(bus6.emitted, "antigravity");
 assert.ok(agFallbackChip && agFallbackChip.state === "active", "antigravity fallback chip should be active");
-assert.equal(stripAnsi(agFallbackChip.icon), "22.4%(6d23h) 0%(6d23h)");
+assert.equal(stripAnsi(agFallbackChip.icon), agExpectedRow);
 
 // ── non-usage model at session start → silent ───────────────────────────
 const bus4 = makeBus();
